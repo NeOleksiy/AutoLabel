@@ -1,589 +1,636 @@
 import streamlit as st
-import sys
+import numpy as np
+from PIL import Image
+import tempfile
 import os
 from pathlib import Path
-from PIL import Image
-import matplotlib.pyplot as plt
 import json
+import matplotlib.pyplot as plt
+import io
 
-# Устанавливаем неинтерактивный бэкенд для matplotlib перед импортом matplotlib
-import matplotlib
-matplotlib.use('Agg')
+# Import your code
+from autolabel import AutoLabel
+from utils.schema import TaskConfig
 
-# Default model parameters
-DEFAULT_MODEL_PARAMS = {
-    'max_tokens': 1024,
-    'temperature': 0.75,
-    'top_p': 0.7,
-    'top_k': 10,
-    'repetition_penalty': 1
-}
+# Page settings
+st.set_page_config(
+    page_title="AutoLabel UI",
+    page_icon="🏷️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# Cache heavy operations
-@st.cache_resource
-def load_autolabel_module():
-    """Lazy loading of AutoLabel module"""
-    from autolabel import AutoLabel
-    return AutoLabel
+# Initialize session state
+if 'autolabel' not in st.session_state:
+    st.session_state.autolabel = None
+if 'current_image' not in st.session_state:
+    st.session_state.current_image = None
+if 'current_image_name' not in st.session_state:
+    st.session_state.current_image_name = None
+if 'raw_predictions' not in st.session_state:
+    st.session_state.raw_predictions = None
+if 'filtered_predictions' not in st.session_state:
+    st.session_state.filtered_predictions = None
+if 'react_predictions' not in st.session_state:
+    st.session_state.react_predictions = None
+if 'keypoint_result' not in st.session_state:
+    st.session_state.keypoint_result = None
 
-def initialize_app():
-    """Initialize application state"""
-    default_keys = [
-        'autolabel', 'initialized', 'current_image', 'raw_result',
-        'filtered_result', 'keypoint_result', 'images_list', 'model_params',
-        'task_config', 'class_names', 'classes_for_similar',
-        'generate_visual_prompting', 'images_path', 'save_path',
-        'prompt_template', 'use_similar_prompting_filter', 'text_threshold',
-        'iou_threshold', 'max_lower_bound', 'min_lower_bound',
-        'keypoint_task_type', 'keypoint_system_prompt', 'keypoint_task_prompt',
-        'raw_fig', 'filtered_fig', 'keypoint_fig'
-    ]
-    
-    for key in default_keys:
-        if key not in st.session_state:
-            if key == 'model_params':
-                st.session_state[key] = DEFAULT_MODEL_PARAMS
-            elif key in ['text_threshold', 'iou_threshold', 'min_lower_bound', 'max_lower_bound']:
-                st.session_state[key] = 0.0 if 'min' in key else (0.05 if 'text' in key else 1.0 if 'max' in key else 0.9)
-            elif key == 'use_similar_prompting_filter':
-                st.session_state[key] = True
-            elif key == 'generate_visual_prompting':
-                st.session_state[key] = True
-            elif key == 'keypoint_task_type':
-                st.session_state[key] = "human_pose"
-            elif key == 'keypoint_system_prompt':
-                st.session_state[key] = "You are a human pose estimation assistant. Detect people and their keypoints accurately."
-            elif key == 'keypoint_task_prompt':
-                st.session_state[key] = "Can you detect each {categories} in the image using a [x0, y0, x1, y1] box format, and then provide the coordinates of its {keypoints} as [x0, y0]? Output the answer in JSON format."
-            elif key == 'prompt_template':
-                st.session_state[key] = "Detect {categories_str}. Output the bounding box coordinates in [x0, y0, x1, y1] format."
+def initialize_autolabel():
+    """Initialize AutoLabel"""
+    try:
+        # Prepare parameters
+        model_params = {
+            'max_tokens': st.session_state.max_tokens,
+            'temperature': st.session_state.temperature,
+            'top_p': st.session_state.top_p,
+            'top_k': st.session_state.top_k,
+            'repetition_penalty': st.session_state.repetition_penalty
+        }
+        
+        # Prepare task_config
+        categories_str = ", ".join(st.session_state.class_names.split(','))
+        task_config = TaskConfig(
+            name="Detection",
+            prompt_template=st.session_state.prompt_template.format(categories=categories_str),
+            description="",
+            output_format="boxes",
+            requires_categories=False,
+        )
+        
+        # Initialize AutoLabel
+        autolabel = AutoLabel(
+            model_params=model_params,
+            task="detection",
+            classes_for_similar_prompting=[x.strip() for x in st.session_state.similar_classes.split(',')] 
+                if st.session_state.similar_classes else [],
+            class_names=[x.strip() for x in st.session_state.class_names.split(',')],
+            images_path=st.session_state.images_path,
+            system_prompt="You are an object detection assistant.",
+            task_config=task_config
+        )
+        
+        st.session_state.autolabel = autolabel
+        return True
+    except Exception as e:
+        st.error(f"Initialization error: {str(e)}")
+        return False
+
+def load_image(image_path):
+    """Load image"""
+    try:
+        image = Image.open(image_path).convert("RGB")
+        st.session_state.current_image = image
+        st.session_state.current_image_name = Path(image_path).name
+        return image
+    except Exception as e:
+        st.error(f"Image loading error: {str(e)}")
+        return None
+
+def run_inference():
+    """Run inference"""
+    try:
+        if st.session_state.current_image and st.session_state.autolabel:
+            result = st.session_state.autolabel.inference(
+                image=st.session_state.current_image,
+                generate_visual_prompting=st.session_state.generate_visual_prompting
+            )
+            
+            if result['success']:
+                st.session_state.raw_predictions = result['predictions']
+                st.success(f"Inference successful! Found objects: {len(result['predictions'])}")
+                return True
             else:
-                st.session_state[key] = None
+                st.error(f"Inference error: {result.get('error', 'Unknown error')}")
+                return False
+    except Exception as e:
+        st.error(f"Inference execution error: {str(e)}")
+        return False
 
-def display_image_with_bboxes(fig):
-    """Display image with bounding boxes"""
-    if fig:
-        st.pyplot(fig)
-        plt.close(fig)
+def run_filter():
+    """Run filtering"""
+    try:
+        if st.session_state.raw_predictions and st.session_state.autolabel:
+            filtered = st.session_state.autolabel.filter(
+                image_name=st.session_state.current_image_name,
+                predictions=st.session_state.raw_predictions.copy(),
+                text_threshold=st.session_state.filter_text_threshold,
+                use_similar_prompting=st.session_state.use_similar_prompting,
+                iou_threshold=st.session_state.filter_iou_threshold,
+                max_lower_bound=st.session_state.max_lower_bound,
+                min_lower_bound=st.session_state.min_lower_bound
+            )
+            
+            st.session_state.filtered_predictions = filtered
+            st.success(f"Filtering successful! Remaining objects: {len(filtered)}")
+            return True
+    except Exception as e:
+        st.error(f"Filtering error: {str(e)}")
+        return False
 
-def save_visualization(fig, image_name, suffix, save_path=None):
-    """Save visualization to file"""
-    if save_path and fig:
-        save_dir = Path(save_path)
-        save_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Create filename without extension
-        stem = Path(image_name).stem
-        output_path = save_dir / f"{stem}_{suffix}.png"
-        
-        try:
-            fig.savefig(output_path, dpi=150, bbox_inches='tight')
-            plt.close(fig)
-            return str(output_path)
-        except Exception as e:
-            st.error(f"Error saving {suffix}: {e}")
-            return None
-    return None
-
-def main():
-    st.set_page_config(
-        page_title="AutoLabel UI",
-        page_icon="🏷️",
-        layout="wide",
-        initial_sidebar_state="expanded"
-    )
-    
-    st.title("🏷️ AutoLabel UI")
-    st.markdown("---")
-    
-    initialize_app()
-    
-    # Section 1: Parameter Initialization
-    if not st.session_state.initialized:
-        st.header("🔧 Parameter Initialization")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            images_path = st.text_input(
-                "Path to images folder",
-                value=st.session_state.images_path or "",
-                help="Absolute path to images folder"
-            )
+def run_react():
+    """Run ReAct"""
+    try:
+        if st.session_state.autolabel and st.session_state.current_image_name:
+            # Use either filtered predictions or raw predictions
+            predictions = st.session_state.filtered_predictions or st.session_state.raw_predictions
             
-            save_path = st.text_input(
-                "Path for saving results",
-                value=st.session_state.save_path or "./output",
-                help="Path for saving annotated images"
-            )
-            
-            class_names_str = st.text_input(
-                "Class names (comma-separated)",
-                value=", ".join(st.session_state.class_names) if st.session_state.class_names else "forklift, pallet, pallet_truck, small_load_carrier, stillage",
-                help="List of detection classes separated by commas"
-            )
-        
-        with col2:
-            prompt_template = st.text_area(
-                "Prompt Template",
-                value=st.session_state.prompt_template,
-                height=100,
-                help="Prompt template for detection"
-            )
-            
-            classes_for_similar_str = st.text_input(
-                "Classes for Similar Prompting (comma-separated)",
-                value=", ".join(st.session_state.classes_for_similar) if st.session_state.classes_for_similar else "pallet, stillage",
-                help="Classes for which similar prompting will be used"
-            )
-            
-            generate_visual_prompting = st.checkbox(
-                "Generate Visual Prompting",
-                value=st.session_state.generate_visual_prompting,
-                help="Whether to use visual prompting during inference"
-            )
-        
-        st.markdown("---")
-        
-        if st.button("🚀 Initialize AutoLabel", type="primary", width='stretch'):
-            with st.spinner("Initializing AutoLabel... This may take a few minutes..."):
-                try:
-                    # Parse parameters
-                    class_names = [name.strip() for name in class_names_str.split(",")]
-                    classes_for_similar = [name.strip() for name in classes_for_similar_str.split(",")] if classes_for_similar_str else []
-                    
-                    # Create TaskConfig
-                    categories_str = ", ".join(class_names)
-                    from utils.schema import TaskConfig
-                    task_config = TaskConfig(
-                        name="Detection",
-                        prompt_template=prompt_template.format(categories_str=categories_str),
-                        description="",
-                        output_format="boxes",
-                        requires_categories=False,
-                    )
-                    
-                    # Save parameters to session state
-                    st.session_state.model_params = DEFAULT_MODEL_PARAMS
-                    st.session_state.task_config = task_config
-                    st.session_state.class_names = class_names
-                    st.session_state.classes_for_similar = classes_for_similar
-                    st.session_state.generate_visual_prompting = generate_visual_prompting
-                    st.session_state.images_path = images_path
-                    st.session_state.save_path = save_path
-                    st.session_state.prompt_template = prompt_template
-                    
-                    # Lazy initialization of AutoLabel
-                    try:
-                        AutoLabel = load_autolabel_module()
-                        
-                        # Initialize AutoLabel
-                        st.session_state.autolabel = AutoLabel(
-                            model_params=DEFAULT_MODEL_PARAMS,
-                            task="detection",
-                            classes_for_similar_prompting=classes_for_similar,
-                            class_names=class_names,
-                            images_path=images_path,
-                            system_prompt="You are an object detection assistant.",
-                            task_config=task_config
-                        )
-                        
-                        # Get list of images
-                        if images_path and Path(images_path).exists():
-                            image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp']
-                            st.session_state.images_list = [
-                                str(f) for f in Path(images_path).iterdir() 
-                                if f.suffix.lower() in image_extensions
-                            ]
-                            st.success(f"✅ Found {len(st.session_state.images_list)} images")
-                        else:
-                            st.warning("⚠️ Images folder not specified or does not exist")
-                            st.session_state.images_list = []
-                        
-                        st.session_state.initialized = True
-                        st.success("✅ AutoLabel successfully initialized!")
-                        st.rerun()
-                        
-                    except Exception as e:
-                        st.error(f"❌ Error initializing AutoLabel: {str(e)}")
-                        
-                except Exception as e:
-                    st.error(f"❌ Initialization error: {str(e)}")
-    
-    else:
-        # AutoLabel is initialized
-        st.sidebar.header("📊 Status")
-        st.sidebar.success("✅ AutoLabel initialized")
-        
-        # Information about current parameters
-        with st.sidebar.expander("📋 Current Parameters"):
-            st.write(f"**Classes:** {', '.join(st.session_state.class_names)}")
-            st.write(f"**Similar prompting for:** {', '.join(st.session_state.classes_for_similar)}")
-            st.write(f"**Visual prompting:** {'Yes' if st.session_state.generate_visual_prompting else 'No'}")
-            st.write(f"**Images folder:** {st.session_state.images_path}")
-            st.write(f"**Save folder:** {st.session_state.save_path}")
-        
-        # Section 2: Image Selection and Inference
-        st.header("🖼️ Image Selection and Inference")
-        
-        if st.session_state.images_list:
-            # Image selection
-            image_files = [Path(img).name for img in st.session_state.images_list]
-            selected_image = st.selectbox(
-                "Select image",
-                options=image_files,
-                index=0
-            )
-            
-            # Find full path to selected image
-            selected_path = next(img for img in st.session_state.images_list 
-                               if Path(img).name == selected_image)
-            
-            # Display image
-            col_img, col_actions = st.columns([2, 1])
-            
-            with col_img:
-                st.subheader("Image")
-                try:
-                    image = Image.open(selected_path)
-                    st.image(image, caption=selected_image, width='stretch')
-                    st.session_state.current_image = image
-                    st.session_state.current_image_path = selected_path
-                    st.session_state.current_image_name = selected_image
-                except Exception as e:
-                    st.error(f"Error loading image: {e}")
-            
-            with col_actions:
-                st.subheader("Actions")
+            if predictions:
+                react_result = st.session_state.autolabel.react(
+                    image_name=st.session_state.current_image_name,
+                    predictions=predictions.copy(),
+                    iou_threshold=st.session_state.react_iou_threshold,
+                    n_repeats=st.session_state.number_repeats
+                )
                 
-                # Button for inference
-                if st.button("🎯 Run Markup", type="primary", width='stretch'):
-                    with st.spinner("Running inference..."):
-                        try:
-                            # Run inference
-                            result = st.session_state.autolabel.inference(
-                                image=selected_path,
-                                generate_visual_prompting=st.session_state.generate_visual_prompting
-                            )
-                            
-                            if result['success']:
-                                st.session_state.raw_result = result
-                                
-                                # Create visualization
-                                fig_raw = st.session_state.autolabel.get_image_with_bboxes(
-                                    result['image_name'],
-                                    show_filtered=False
-                                )
-                                st.session_state.raw_fig = fig_raw
-                                
-                                st.success(f"✅ Inference complete: {len(result['predictions'])} predictions")
-                            else:
-                                st.error(f"Inference error: {result.get('error', 'Unknown error')}")
-                                
-                        except Exception as e:
-                            st.error(f"Error during inference: {str(e)}")
+                st.session_state.react_predictions = react_result
+                st.success(f"ReAct successful! Total objects: {len(react_result)}")
+                return True
+            else:
+                st.warning("No predictions for ReAct")
+                return False
+    except Exception as e:
+        st.error(f"ReAct error: {str(e)}")
+        return False
+
+def run_keypoint_task():
+    """Run keypoint task"""
+    try:
+        if st.session_state.autolabel and st.session_state.current_image:
+            # Use either filtered predictions or raw predictions
+            predictions = st.session_state.filtered_predictions or st.session_state.raw_predictions
+            
+            if predictions:
+                result = st.session_state.autolabel.apply_additional_task(
+                    image=st.session_state.current_image,
+                    predictions=predictions,
+                    task_type=st.session_state.keypoint_task_type,
+                    system_promt=st.session_state.keypoint_system_prompt,
+                    promt=st.session_state.keypoint_task_prompt
+                )
+                
+                st.session_state.keypoint_result = result
+                
+                if result['success']:
+                    kp_result = result['keypoint_result']
+                    st.success(f"Keypoint task successful! Processed objects: {kp_result.get('success_count', 0)}")
+                    return True
+                else:
+                    st.error("Keypoint task failed")
+                    return False
+            else:
+                st.warning("No predictions for keypoint task")
+                return False
+    except Exception as e:
+        st.error(f"Keypoint task error: {str(e)}")
+        return False
+
+def get_image_with_bboxes(image, predictions, title="Image with BBoxes"):
+    """Create image with bounding boxes"""
+    try:
+        if not predictions:
+            fig, ax = plt.subplots(figsize=(10, 8))
+            ax.imshow(image)
+            ax.set_title(title)
+            ax.axis('off')
+            return fig
+        
+        # Use method from AutoLabel if available
+        if st.session_state.autolabel:
+            # Create temporary entry in raw_predictions to use the method
+            temp_data = {
+                'image': image,
+                'predictions': predictions,
+                'path': st.session_state.current_image_name
+            }
+            st.session_state.autolabel.raw_predictions[st.session_state.current_image_name] = temp_data
+            
+            fig = st.session_state.autolabel.get_image_with_bboxes(
+                img_name=st.session_state.current_image_name,
+                show_filtered=True
+            )
+            
+            if fig:
+                fig.suptitle(title, fontsize=16)
+                return fig
+        
+        # If method didn't work, create simple visualization
+        fig, ax = plt.subplots(figsize=(10, 8))
+        ax.imshow(image)
+        
+        # Draw bounding boxes
+        for pred in predictions:
+            if 'coords' in pred:
+                coords = pred['coords']
+                category = pred.get('category', 'Unknown')
+                score = pred.get('score', 1.0)
+                
+                rect = plt.Rectangle(
+                    (coords[0], coords[1]), 
+                    coords[2] - coords[0], 
+                    coords[3] - coords[1],
+                    linewidth=2, 
+                    edgecolor='red', 
+                    facecolor='none'
+                )
+                ax.add_patch(rect)
+                
+                ax.text(
+                    coords[0], 
+                    coords[1] - 5, 
+                    f"{category}: {score:.2f}",
+                    bbox=dict(facecolor='yellow', alpha=0.7),
+                    fontsize=9,
+                    color='black'
+                )
+        
+        ax.set_title(title)
+        ax.axis('off')
+        plt.tight_layout()
+        return fig
+    except Exception as e:
+        st.error(f"Visualization error: {str(e)}")
+        return None
+
+# Application title
+st.title("🏷️ AutoLabel UI")
+st.markdown("---")
+
+# Main application structure
+tab1, tab2 = st.tabs(["🚀 Initialization", "🎯 Annotation"])
+
+with tab1:
+    # Initialization section
+    st.header("Initialize AutoLabel")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Model parameters
+        st.subheader("Model Parameters")
+        st.number_input("max_tokens", min_value=256, max_value=4096, value=1024, key="max_tokens", step=256)
+        st.slider("temperature", min_value=0.0, max_value=2.0, value=0.75, key="temperature", step=0.05)
+        st.slider("top_p", min_value=0.0, max_value=1.0, value=0.7, key="top_p", step=0.05)
+        st.number_input("top_k", min_value=1, max_value=100, value=10, key="top_k", step=1)
+        st.slider("repetition_penalty", min_value=0.0, max_value=2.0, value=1.0, key="repetition_penalty", step=0.1)
+        
+        # Data settings
+        st.subheader("Data Settings")
+        st.text_input("Path to images folder", value="./images", key="images_path")
+        
+        # Class names
+        st.text_input("Class names (comma-separated)", 
+                     value="cat, dog, person, car", 
+                     key="class_names",
+                     help="Example: cat, dog, person, car")
+        
+        # Classes for similar prompting
+        st.text_input("Classes for similar prompting (comma-separated)", 
+                     value="cat, dog", 
+                     key="similar_classes",
+                     help="Leave empty to disable")
+    
+    with col2:
+        # Prompt template
+        st.subheader("Prompt Template")
+        default_prompt = "Detect {categories}. Output the bounding box coordinates in [x0, y0, x1, y1] format."
+        st.text_area("Prompt Template", 
+                    value=default_prompt,
+                    key="prompt_template",
+                    height=150,
+                    help="Use {categories} to insert class list")
+        
+        # Visual prompting
+        st.subheader("Visual Prompting")
+        st.checkbox("Enable Visual Prompting", value=True, key="generate_visual_prompting")
+        
+        # Initialization button
+        st.markdown("---")
+        if st.button("🚀 Initialize AutoLabel", type="primary", width='stretch'):
+            with st.spinner("Initializing AutoLabel..."):
+                if initialize_autolabel():
+                    st.success("AutoLabel successfully initialized!")
+                    
+                    # Show initialization info
+                    if st.session_state.autolabel:
+                        st.info(f"""
+                        **Initialization Information:**
+                        - Number of classes: {len(st.session_state.autolabel.class_names)}
+                        - Classes for similar prompting: {st.session_state.autolabel.classes_for_similar_prompting}
+                        - OwlViT available: {st.session_state.autolabel.owlvit_available}
+                        """)
+
+with tab2:
+    if not st.session_state.autolabel:
+        st.warning("Please initialize AutoLabel first in the 'Initialization' tab")
+    else:
+        # Image loading
+        st.header("Image Loading")
+        
+        images_path = Path(st.session_state.images_path)
+        if images_path.exists() and images_path.is_dir():
+            image_files = list(images_path.glob("*.jpg")) + list(images_path.glob("*.jpeg")) + \
+                         list(images_path.glob("*.png")) + list(images_path.glob("*.bmp"))
+            
+            if image_files:
+                image_names = [f.name for f in image_files]
+                selected_image = st.selectbox("Select image:", image_names)
+                
+                col1, col2 = st.columns([1, 2])
+                
+                with col1:
+                    if st.button("📥 Load Image", width='stretch'):
+                        image_path = images_path / selected_image
+                        with st.spinner("Loading image..."):
+                            image = load_image(image_path)
+                            if image:
+                                st.success(f"Image loaded: {selected_image}")
+                
+                with col2:
+                    if st.session_state.current_image:
+                        # Show image
+                        st.image(st.session_state.current_image, caption=f"Current image: {selected_image}", width='content')
+                        
+                        # Inference button
+                        col_a, col_b = st.columns([1, 1])
+                        with col_a:
+                            if st.button("🎯 Run Inference", type="primary", width='stretch'):
+                                with st.spinner("Running inference..."):
+                                    if run_inference():
+                                        st.rerun()
+                        with col_b:
+                            if st.session_state.raw_predictions:
+                                st.info(f"Found objects: {len(st.session_state.raw_predictions)}")
+            else:
+                st.error(f"No images found in folder {st.session_state.images_path}")
+        else:
+            st.error(f"Folder {st.session_state.images_path} does not exist")
+        
+        # Main annotation interface
+        if st.session_state.current_image:
+            st.markdown("---")
+            
+            # 4 images in a row
+            st.subheader("Processing Results")
+            
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                if st.session_state.current_image:
+                    st.image(st.session_state.current_image, caption="Original Image", width='content')
+            
+            with col2:
+                if st.session_state.raw_predictions is not None:
+                    fig = get_image_with_bboxes(
+                        st.session_state.current_image, 
+                        st.session_state.raw_predictions,
+                        "After Inference"
+                    )
+                    if fig:
+                        buf = io.BytesIO()
+                        fig.savefig(buf, format='png', bbox_inches='tight', dpi=100)
+                        buf.seek(0)
+                        st.image(buf, caption=f"Inference: {len(st.session_state.raw_predictions)} objects", width='content')
+                        plt.close(fig)
+                else:
+                    st.info("Click 'Run Inference'")
+            
+            with col3:
+                if st.session_state.react_predictions is not None:
+                    fig = get_image_with_bboxes(
+                        st.session_state.current_image, 
+                        st.session_state.react_predictions,
+                        "After ReAct"
+                    )
+                    if fig:
+                        buf = io.BytesIO()
+                        fig.savefig(buf, format='png', bbox_inches='tight', dpi=100)
+                        buf.seek(0)
+                        st.image(buf, caption=f"ReAct: {len(st.session_state.react_predictions)} objects", width='content')
+                        plt.close(fig)
+                else:
+                    st.info("Run ReAct below")
+            
+            with col4:
+                if st.session_state.filtered_predictions is not None:
+                    fig = get_image_with_bboxes(
+                        st.session_state.current_image, 
+                        st.session_state.filtered_predictions,
+                        "After Filtering"
+                    )
+                    if fig:
+                        buf = io.BytesIO()
+                        fig.savefig(buf, format='png', bbox_inches='tight', dpi=100)
+                        buf.seek(0)
+                        st.image(buf, caption=f"Filtering: {len(st.session_state.filtered_predictions)} objects", width='content')
+                        plt.close(fig)
+                else:
+                    st.info("Run filtering")
             
             st.markdown("---")
             
-            # Section 3: Results Display and Filtering
-            if st.session_state.raw_result:
-                st.header("📊 Results")
+            # Two columns with tools (without Keypoint Task)
+            col_filter, col_react = st.columns(2)
+            
+            with col_filter:
+                st.subheader("🔧 Filtering")
                 
-                # Display RawResult and FilterResult side by side
-                col_raw, col_filter = st.columns(2)
+                st.slider("Text Threshold", 0.0, 1.0, 0.05, 0.01, key="filter_text_threshold")
+                st.checkbox("Use Similar Prompting", True, key="use_similar_prompting")
+                st.slider("IoU Threshold", 0.0, 1.0, 0.9, 0.05, key="filter_iou_threshold")
+                st.slider("Max Lower Bound", 0.0, 2.0, 1.0, 0.1, key="max_lower_bound")
+                st.slider("Min Lower Bound", 0.0, 1.0, 0.0, 0.1, key="min_lower_bound")
                 
-                with col_raw:
-                    st.subheader("Raw Result")
-                    if st.session_state.raw_fig:
-                        display_image_with_bboxes(st.session_state.raw_fig)
-                    
-                    # Raw result info
-                    if st.session_state.raw_result and st.session_state.raw_result.get('predictions'):
-                        predictions = st.session_state.raw_result['predictions']
-                        st.metric("Number of predictions", len(predictions))
-                        
-                        # Save RawResult button
-                        if st.button("💾 Save Raw Result", type="secondary", width='stretch'):
-                            if st.session_state.raw_fig and st.session_state.save_path:
-                                saved_path = save_visualization(
-                                    st.session_state.raw_fig, 
-                                    st.session_state.current_image_name, 
-                                    "raw", 
-                                    st.session_state.save_path
-                                )
-                                if saved_path:
-                                    st.success(f"✅ Raw result saved: {saved_path}")
-                            else:
-                                st.warning("No raw result visualization available")
+                if st.button("🔍 Apply Filtering", width='stretch'):
+                    with st.spinner("Applying filtering..."):
+                        run_filter()
+                        st.rerun()
+            
+            with col_react:
+                st.subheader("🔄 ReAct")
                 
-                # Filtering section
-                with col_filter:
-                    st.subheader("Filtering")
-                    
-                    # Filter parameters
-                    with st.expander("Filter Settings", expanded=True):
-                        text_threshold = st.slider(
-                            "Text Threshold",
-                            min_value=0.0,
-                            max_value=1.0,
-                            value=st.session_state.text_threshold,
-                            step=0.01,
-                            help="Threshold for text alignment"
-                        )
-                        
-                        use_similar_prompting = st.checkbox(
-                            "Use Similar Prompting",
-                            value=st.session_state.use_similar_prompting_filter
-                        )
-                        
-                        iou_threshold = st.slider(
-                            "IoU Threshold",
-                            min_value=0.0,
-                            max_value=1.0,
-                            value=st.session_state.iou_threshold,
-                            step=0.01,
-                            help="Threshold for NMS"
-                        )
-                        
-                        col_bounds = st.columns(2)
-                        with col_bounds[0]:
-                            min_lower_bound = st.slider(
-                                "Min Lower Bound",
-                                min_value=0.0,
-                                max_value=1.0,
-                                value=st.session_state.min_lower_bound,
-                                step=0.01,
-                                help="Minimum relative size"
-                            )
-                        
-                        with col_bounds[1]:
-                            max_lower_bound = st.slider(
-                                "Max Lower Bound",
-                                min_value=0.0,
-                                max_value=1.0,
-                                value=st.session_state.max_lower_bound,
-                                step=0.01,
-                                help="Maximum relative size"
-                            )
-                        
-                        # Save filter values
-                        st.session_state.text_threshold = text_threshold
-                        st.session_state.use_similar_prompting_filter = use_similar_prompting
-                        st.session_state.iou_threshold = iou_threshold
-                        st.session_state.min_lower_bound = min_lower_bound
-                        st.session_state.max_lower_bound = max_lower_bound
-                    
-                    # Filter button
-                    if st.button("🔍 Apply Filtering", type="primary", width='stretch'):
-                        with st.spinner("Applying filters..."):
-                            try:
-                                filtered_predictions = st.session_state.autolabel.filter(
-                                    image_name=st.session_state.raw_result['image_name'],
-                                    predictions=st.session_state.raw_result['predictions'].copy(),
-                                    text_threshold=text_threshold,
-                                    use_similar_prompting=use_similar_prompting,
-                                    iou_threshold=iou_threshold,
-                                    max_lower_bound=max_lower_bound,
-                                    min_lower_bound=min_lower_bound
-                                )
-                                
-                                st.session_state.filtered_result = {
-                                    'image_name': st.session_state.raw_result['image_name'],
-                                    'predictions': filtered_predictions
-                                }
-                                
-                                # Create filtered visualization
-                                fig_filtered = st.session_state.autolabel.get_image_with_bboxes(
-                                    st.session_state.raw_result['image_name'],
-                                    show_filtered=True
-                                )
-                                st.session_state.filtered_fig = fig_filtered
-                                
-                                before = len(st.session_state.raw_result['predictions'])
-                                after = len(filtered_predictions)
-                                st.success(f"✅ Filtering complete: {after} predictions (was {before})")
-                                
-                            except Exception as e:
-                                st.error(f"Filtering error: {str(e)}")
-                    
-                    # Display filtered result
-                    if st.session_state.filtered_fig:
-                        display_image_with_bboxes(st.session_state.filtered_fig)
-                        
-                        if st.session_state.filtered_result:
-                            st.metric("Filtered predictions", len(st.session_state.filtered_result['predictions']))
-                            
-                            # Save FilterResult button
-                            if st.button("💾 Save Filtered Result", type="secondary", width='stretch'):
-                                if st.session_state.filtered_fig and st.session_state.save_path:
-                                    saved_path = save_visualization(
-                                        st.session_state.filtered_fig, 
-                                        st.session_state.current_image_name, 
-                                        "filtered", 
-                                        st.session_state.save_path
-                                    )
-                                    if saved_path:
-                                        st.success(f"✅ Filtered result saved: {saved_path}")
-                                else:
-                                    st.warning("No filtered result visualization available")
+                st.number_input("Number of Repeats", 1, 10, 2, key="number_repeats")
+                st.slider("ReAct IoU Threshold", 0.0, 1.0, 0.9, 0.05, key="react_iou_threshold")
                 
+                if st.button("⚡ Run ReAct", width='stretch'):
+                    with st.spinner("Running ReAct..."):
+                        run_react()
+                        st.rerun()
+            
+            # Show statistics
+            st.markdown("---")
+            
+            if st.session_state.autolabel and st.session_state.autolabel.stats:
+                st.subheader("📊 Statistics")
+                
+                stats = st.session_state.autolabel.stats
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    st.metric("Total Images", stats.get('total_images', 0))
+                    st.metric("Successful Inferences", stats.get('successful_inferences', 0))
+                
+                with col2:
+                    st.metric("Total Predictions", stats.get('total_predictions', 0))
+                    st.metric("Filtered Predictions", stats.get('total_filtered_predictions', 0))
+                
+                with col3:
+                    st.metric("Visual Prompting", stats.get('visual_prompting_predictions', 0))
+                    st.metric("NMS Filtered", stats.get('nms_filtered', 0))
+                
+                with col4:
+                    if st.session_state.raw_predictions:
+                        st.metric("Current Predictions", len(st.session_state.raw_predictions))
+                    if st.session_state.filtered_predictions:
+                        st.metric("After Filtering", len(st.session_state.filtered_predictions))
+            
+            # Keypoint Task - below statistics
+            st.markdown("---")
+            st.subheader("📍 Keypoint Task")
+            
+            col_keypoint1, col_keypoint2, col_keypoint3 = st.columns(3)
+            
+            with col_keypoint1:
+                st.selectbox(
+                    "Task Type",
+                    ["human_pose", "animal_pose", "face_keypoint"],
+                    key="keypoint_task_type"
+                )
+                
+                st.text_area(
+                    "System Prompt",
+                    value="You are a pose estimation assistant. Detect people and their keypoints accurately.",
+                    height=80,
+                    key="keypoint_system_prompt"
+                )
+            
+            with col_keypoint2:
+                st.text_area(
+                    "Task Prompt",
+                    value="Can you detect each {categories} in the image using a [x0, y0, x1, y1] box format, and then provide the coordinates of its {keypoints} as [x0, y0]? Output the answer in JSON format.",
+                    height=120,
+                    key="keypoint_task_prompt"
+                )
+            
+            with col_keypoint3:
+                st.markdown("<br><br>", unsafe_allow_html=True)  # Spacing
+                if st.button("🎯 Run Keypoint Task", type="primary", width='stretch'):
+                    with st.spinner("Running Keypoint Task..."):
+                        run_keypoint_task()
+                        st.rerun()
+                
+                # Result information
+                if st.session_state.keypoint_result:
+                    if st.session_state.keypoint_result.get('success'):
+                        kp_result = st.session_state.keypoint_result.get('keypoint_result', {})
+                        st.success(f"✅ Successfully processed: {kp_result.get('success_count', 0)} objects")
+                        
+                        # Additional information
+                        if 'keypoint_names' in kp_result:
+                            st.info(f"Keypoint names: {', '.join(kp_result['keypoint_names'][:5])}{'...' if len(kp_result['keypoint_names']) > 5 else ''}")
+                    else:
+                        st.error("❌ Keypoint task failed")
+            
+            # Display Keypoint Task result
+            if st.session_state.keypoint_result and st.session_state.keypoint_result.get('success'):
                 st.markdown("---")
+                st.subheader("📊 Keypoint Task Result")
                 
-                # Section 4: Keypoint Task
-                st.header("📍 Keypoint Task")
+                kp_result = st.session_state.keypoint_result.get('keypoint_result', {})
                 
-                col_kp_params, col_kp_result = st.columns([1, 2])
+                col_kp1, col_kp2 = st.columns([2, 1])
                 
-                with col_kp_params:
-                    st.subheader("Keypoint Settings")
-                    
-                    keypoint_task_type = st.selectbox(
-                        "Keypoint Task Type",
-                        options=["human_pose", "animal_pose", "face_keypoint"],
-                        index=["human_pose", "animal_pose", "face_keypoint"].index(
-                            st.session_state.keypoint_task_type
-                        ) if st.session_state.keypoint_task_type in ["human_pose", "animal_pose", "face_keypoint"] else 0
-                    )
-                    
-                    system_prompt = st.text_area(
-                        "System Prompt",
-                        value=st.session_state.keypoint_system_prompt,
-                        height=100
-                    )
-                    
-                    task_prompt = st.text_area(
-                        "Task Prompt",
-                        value=st.session_state.keypoint_task_prompt,
-                        height=100
-                    )
-                    
-                    # Save keypoint parameters
-                    st.session_state.keypoint_task_type = keypoint_task_type
-                    st.session_state.keypoint_system_prompt = system_prompt
-                    st.session_state.keypoint_task_prompt = task_prompt
-                    
-                    # Keypoint markup button
-                    if st.button("🎯 Run Keypoint Markup", type="primary", width='stretch'):
-                        with st.spinner("Running keypoint markup..."):
-                            try:
-                                # Use either filtered or raw predictions
-                                predictions_to_use = (
-                                    st.session_state.filtered_result['predictions'] 
-                                    if st.session_state.filtered_result 
-                                    else st.session_state.raw_result['predictions']
-                                )
-                                
-                                if predictions_to_use:
-                                    keypoint_result = st.session_state.autolabel.apply_additional_task(
-                                        image=st.session_state.current_image_path,
-                                        predictions=predictions_to_use,
-                                        task_type=keypoint_task_type,
-                                        system_promt=system_prompt,
-                                        promt=task_prompt
-                                    )
-                                    
-                                    st.session_state.keypoint_result = keypoint_result
-                                    
-                                    if keypoint_result['success']:
-                                        # Create keypoint visualization
-                                        fig_kp = st.session_state.autolabel.get_image_with_bboxes(
-                                            st.session_state.raw_result['image_name'],
-                                            show_filtered=True,
-                                            keypoint_result=keypoint_result
-                                        )
-                                        st.session_state.keypoint_fig = fig_kp
-                                        st.success("✅ Keypoint detection complete!")
-                                    else:
-                                        st.error("Keypoint detection failed")
-                                else:
-                                    st.warning("⚠️ No predictions available for keypoint detection")
-                                        
-                            except Exception as e:
-                                st.error(f"Keypoint task error: {str(e)}")
+                with col_kp1:
+                    # Show image with keypoints if available
+                    if st.session_state.filtered_predictions and st.session_state.autolabel:
+                        try:
+                            fig = st.session_state.autolabel.get_image_with_bboxes(
+                                img_name=st.session_state.current_image_name,
+                                show_filtered=True,
+                                keypoint_result=st.session_state.keypoint_result
+                            )
+                            if fig:
+                                buf = io.BytesIO()
+                                fig.savefig(buf, format='png', bbox_inches='tight', dpi=100)
+                                buf.seek(0)
+                                st.image(buf, caption="Keypoints Result", width='content')
+                                plt.close(fig)
+                        except Exception as e:
+                            st.warning(f"Failed to display keypoints: {e}")
                 
-                with col_kp_result:
-                    st.subheader("Keypoint Result")
+                with col_kp2:
+                    # Detailed keypoint information
+                    st.subheader("Details")
                     
-                    if st.session_state.keypoint_fig:
-                        display_image_with_bboxes(st.session_state.keypoint_fig)
+                    if 'keypoints' in kp_result and kp_result['keypoints']:
+                        st.metric("Detected Objects", kp_result.get('success_count', 0))
+                        st.metric("Keypoints per Object", len(kp_result.get('keypoint_names', [])))
                         
-                        # Save Keypoint Result button
-                        if st.button("💾 Save Keypoint Result", type="secondary", width='stretch'):
-                            if st.session_state.keypoint_fig and st.session_state.save_path:
-                                saved_path = save_visualization(
-                                    st.session_state.keypoint_fig, 
-                                    st.session_state.current_image_name, 
-                                    "keypoints", 
-                                    st.session_state.save_path
-                                )
-                                if saved_path:
-                                    st.success(f"✅ Keypoint result saved: {saved_path}")
-                            else:
-                                st.warning("No keypoint visualization available")
+                        # Show example keypoints for first object
+                        if kp_result['keypoints']:
+                            first_person_kps = kp_result['keypoints'][0]
+                            visible_kps = sum(1 for kp in first_person_kps if kp[0] > 0 and kp[1] > 0)
+                            st.metric("Visible Points (1st object)", f"{visible_kps}/{len(first_person_kps)}")
                     
-                    # Keypoint information
-                    if st.session_state.keypoint_result and st.session_state.keypoint_result.get('success'):
-                        kp_result = st.session_state.keypoint_result['keypoint_result']
-                        st.metric("Successfully processed", kp_result.get('success_count', 0))
+                    # JSON result for debugging
+                    with st.expander("🔍 Show JSON Result"):
+                        st.json(kp_result)
+            
+            # Debugging and export
+            st.markdown("---")
+            
+            with st.expander("🔍 Debugging & Export"):
+                col_debug1, col_debug2 = st.columns(2)
+                
+                with col_debug1:
+                    if st.session_state.raw_predictions:
+                        st.subheader("Raw Predictions")
+                        st.json(st.session_state.raw_predictions[:5])  # Show only first 5
                         
-                        if kp_result.get('keypoints'):
-                            keypoint_names = kp_result.get('keypoint_names', [])
-                            st.write(f"**Keypoint names:** {', '.join(keypoint_names[:5])}{'...' if len(keypoint_names) > 5 else ''}")
-                            
-                            # Show keypoints details
-                            with st.expander("Show keypoints details"):
-                                for person_idx, person_kps in enumerate(kp_result['keypoints'][:2]):
-                                    st.write(f"**Person {person_idx + 1}:**")
-                                    for kp_idx, (kp_name, kp_coords) in enumerate(zip(keypoint_names, person_kps)):
-                                        if kp_idx < 5:
-                                            st.write(f"  {kp_name}: {kp_coords}")
-            
-            else:
-                st.info("ℹ️ Run inference on an image to access filtering and keypoint tasks.")
-        
-        else:
-            st.warning("⚠️ No images found in the specified folder or folder does not exist.")
-            
-            # Show current parameters
-            with st.expander("Current Parameters"):
-                st.json({
-                    "class_names": st.session_state.class_names,
-                    "classes_for_similar": st.session_state.classes_for_similar,
-                    "images_path": st.session_state.images_path,
-                    "save_path": st.session_state.save_path
-                })
-        
-        # Reset button
-        st.markdown("---")
-        col1, col2, col3 = st.columns(3)
-        with col2:
-            if st.button("🔄 Reset and Start Over", type="secondary", width='stretch'):
-                # Clear UI state while preserving some parameters
-                keys_to_keep = [
-                    'model_params', 'class_names', 'classes_for_similar',
-                    'generate_visual_prompting', 'images_path', 'save_path',
-                    'prompt_template', 'text_threshold', 'iou_threshold',
-                    'min_lower_bound', 'max_lower_bound', 'use_similar_prompting_filter',
-                    'keypoint_task_type', 'keypoint_system_prompt', 'keypoint_task_prompt'
-                ]
+                        if st.button("📥 Export Raw Predictions", width='stretch'):
+                            predictions_json = json.dumps(st.session_state.raw_predictions, indent=2)
+                            st.download_button(
+                                label="Download as JSON",
+                                data=predictions_json,
+                                file_name=f"raw_predictions_{st.session_state.current_image_name}.json",
+                                mime="application/json"
+                            )
                 
-                # Create temporary copy of values to keep
-                saved_values = {}
-                for key in keys_to_keep:
-                    if key in st.session_state:
-                        saved_values[key] = st.session_state[key]
+                with col_debug2:
+                    if st.session_state.filtered_predictions:
+                        st.subheader("Filtered Predictions")
+                        st.json(st.session_state.filtered_predictions[:5])
+                        
+                        if st.button("📥 Export Filtered Predictions", width='stretch'):
+                            predictions_json = json.dumps(st.session_state.filtered_predictions, indent=2)
+                            st.download_button(
+                                label="Download as JSON",
+                                data=predictions_json,
+                                file_name=f"filtered_predictions_{st.session_state.current_image_name}.json",
+                                mime="application/json"
+                            )
                 
-                # Clear all keys
-                for key in list(st.session_state.keys()):
-                    del st.session_state[key]
-                
-                # Restore saved values
-                for key, value in saved_values.items():
-                    st.session_state[key] = value
-                
-                # Reinitialize basic values
-                st.session_state.initialized = False
-                st.rerun()
+                # Reset button
+                if st.button("🔄 Reset All Results", type="secondary", width='stretch'):
+                    for key in ['raw_predictions', 'filtered_predictions', 'react_predictions', 'keypoint_result']:
+                        if key in st.session_state:
+                            st.session_state[key] = None
+                    st.rerun()
 
-if __name__ == "__main__":
-    main()
+# CSS styles for better UI
+st.markdown("""
+<style>
+    .stButton > button {
+        width: 100%;
+    }
+    .stProgress > div > div > div > div {
+        background-color: #4CAF50;
+    }
+    .metric-card {
+        background-color: #f0f2f6;
+        padding: 10px;
+        border-radius: 10px;
+        margin: 10px 0;
+    }
+</style>
+""", unsafe_allow_html=True)

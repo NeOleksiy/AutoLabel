@@ -192,6 +192,140 @@ class AutoLabel:
         self.stats['visual_prompting_predictions'] += len(predictions)
         
         return predictions
+    
+    def react(self, 
+            image_name: str, 
+            predictions: List[Dict[str, Any]], 
+            iou_threshold: float = 0.9,
+            n_repeats: int = 2) -> List[Dict[str, Any]]:
+
+        logger.info(f"Starting REACT method for {image_name}, n_repeats={n_repeats}")
+        
+        # Получаем изображение
+        if image_name not in self.raw_predictions:
+            logger.error(f"Image {image_name} not found in raw_predictions")
+            return predictions
+        
+        image_data = self.raw_predictions[image_name]
+        image = image_data['image']
+        
+        # Копируем текущие предсказания
+        current_predictions = predictions.copy()
+        
+        # Собираем информацию о уже найденных объектах для промта
+        found_objects_by_category = {}
+        for pred in current_predictions:
+            if 'category' in pred and 'coords' in pred:
+                category = pred['category']
+                if category not in found_objects_by_category:
+                    found_objects_by_category[category] = []
+                # Сохраняем упрощенную информацию о боксе
+                coords = pred['coords']
+                found_objects_by_category[category].append({
+                    'bbox': f"[{coords[0]:.0f}, {coords[1]:.0f}, {coords[2]:.0f}, {coords[3]:.0f}]",
+                    'area': (coords[2] - coords[0]) * (coords[3] - coords[1])
+                })
+        
+        for repeat_idx in range(n_repeats):
+            logger.info(f"REACT iteration {repeat_idx + 1}/{n_repeats}")
+            
+            # Создаем промт с информацией об уже найденных объектах
+            base_prompt = "You are a precise object detection assistant. "
+            
+            if found_objects_by_category:
+                base_prompt += "I have already detected the following objects:\n"
+                
+                for category, objects in found_objects_by_category.items():
+                    base_prompt += f"- {category}: {len(objects)} objects "
+                    if objects:
+                        # Вычисляем средний размер для этой категории
+                        avg_area = sum(obj['area'] for obj in objects) / len(objects)
+                        base_prompt += f"(average size: {avg_area:.0f} pixels^2)\n"
+                    else:
+                        base_prompt += "\n"
+                
+                base_prompt += "\nNow, please find NEW objects that I might have missed. "
+                base_prompt += "Focus on:\n"
+                base_prompt += "1. Smaller objects that could be overlooked\n"
+                base_prompt += "2. Objects partially occluded or at image edges\n"
+                base_prompt += "3. Objects with unusual poses or orientations\n"
+                base_prompt += "4. Objects that are similar to found ones but in different locations\n"
+                base_prompt += "\nDo NOT repeat detections of already found objects. "
+                base_prompt += "If you're unsure whether something is new, check if it overlaps significantly with existing detections."
+            else:
+                base_prompt += "Please detect objects in the image carefully."
+            
+            # Добавляем инструкцию по формату вывода
+            base_prompt += "\n\nOutput format: List of objects with categories and [x0, y0, x1, y1] bounding boxes."
+            
+            # Создаем временный task_config с обновленным промтом
+            from utils.schema import TaskConfig
+            
+            react_task_config = TaskConfig(
+                name="REACT Detection",
+                prompt_template=base_prompt,
+                description="Find new objects that were missed in previous passes",
+                output_format="boxes",
+                requires_categories=False,
+            )
+            
+            # Запускаем inference с новым промтом
+            try:
+                # Подготовка параметров для inference
+                inference_params = {
+                    'images': image,
+                    'task': "detection",
+                    'task_config': react_task_config,
+                }
+                
+                # Передаем категории, если они заданы
+                if self.class_names:
+                    inference_params['categories'] = self.class_names
+                
+                # Выполняем inference
+                results = self.rex.inference(**inference_params)
+                
+                # Извлекаем предсказания
+                new_predictions = self.safe_get_predictions(results)
+                new_box_predictions = [pred for pred in new_predictions 
+                                      if isinstance(pred, dict) and pred.get("type") == "box"]
+                
+                logger.info(f"REACT iteration {repeat_idx + 1} found {len(new_box_predictions)} new predictions")
+                
+                # Добавляем метку о источнике
+                for pred in new_box_predictions:
+                    pred['source'] = f'react_{repeat_idx + 1}'
+                
+                # Добавляем новые предсказания к текущим
+                current_predictions.extend(new_box_predictions)
+                
+                # Обновляем информацию о найденных объектах для следующей итерации
+                for pred in new_box_predictions:
+                    if 'category' in pred and 'coords' in pred:
+                        category = pred['category']
+                        coords = pred['coords']
+                        if category not in found_objects_by_category:
+                            found_objects_by_category[category] = []
+                        found_objects_by_category[category].append({
+                            'bbox': f"[{coords[0]:.0f}, {coords[1]:.0f}, {coords[2]:.0f}, {coords[3]:.0f}]",
+                            'area': (coords[2] - coords[0]) * (coords[3] - coords[1])
+                        })
+                
+                # Применяем NMS для удаления дубликатов
+                current_predictions = self.apply_iou_threshold(current_predictions, iou_threshold)
+                
+                logger.info(f"After REACT iteration {repeat_idx + 1}: {len(current_predictions)} total predictions")
+                
+            except Exception as e:
+                logger.error(f"Error in REACT iteration {repeat_idx + 1}: {e}")
+                break
+        
+        # Обновляем статистику
+        self.stats['total_predictions'] += (len(current_predictions) - len(predictions))
+        
+        logger.info(f"REACT completed. Found {len(current_predictions) - len(predictions)} additional predictions")
+        
+        return current_predictions
             
 
     
@@ -723,10 +857,10 @@ if __name__ == "__main__":
     }
     
     # Классы для детекции (добавим 'person' для тестирования keypoints)
-    class_names = ['cat','dog']
+    class_names = ['water','eggs', 'yogurt', 'banana']
     
     # Путь к изображению
-    image_path = "autolabel/images/test_animal.jpg"
+    image_path = "/home/efimenko.aleksey7/rex/Rex-Omni/grocery-shopping-images-2/test/images/aaa.jpg"
     
     print(f"\n{'='*60}")
     print(f"Processing image: {image_path}")
@@ -791,6 +925,22 @@ if __name__ == "__main__":
             source = pred.get('source', 'unknown')
             coords_str = f"[{coords[0]:.1f}, {coords[1]:.1f}, {coords[2]:.1f}, {coords[3]:.1f}]" if coords else "[]"
             print(f"   {i+1}. {category:20s} - score: {score:.3f}, source: {source}, bbox: {coords_str}")
+
+        reactults = auto_label.react(
+                image_name=image_name,
+                predictions=predictions.copy(),
+        )
+
+        print("\n React Predictions details:")
+        for i, pred in enumerate(reactults):
+            category = pred.get('category', 'Unknown')
+            coords = pred.get('coords', [])
+            score = pred.get('score', 0.0)
+            source = pred.get('source', 'unknown')
+            coords_str = f"[{coords[0]:.1f}, {coords[1]:.1f}, {coords[2]:.1f}, {coords[3]:.1f}]" if coords else "[]"
+            print(f"   {i+1}. {category:20s} - score: {score:.3f}, source: {source}, bbox: {coords_str}")
+        
+
         
         # 2. Фильтруем предсказания
         print("\nStep 2: Filtering predictions...")

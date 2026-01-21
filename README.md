@@ -40,3 +40,7 @@ streamlit run test_app.py
 ## Эксперименты
 
 ([google-таблица](https://docs.google.com/spreadsheets/d/1-dlnk3lfv7v4nxOmM5kfMtUcvFE5Tyd9v6ZDt35DQLc/edit?gid=1311225532#gid=1311225532)
+
+## Презентация 
+
+([google-таблица](https://docs.google.com/presentation/d/1-DPKsnW0Eq-iTcLJ87VJdkM5R902oD8tMTEBItQEvgI/edit?usp=sharing)

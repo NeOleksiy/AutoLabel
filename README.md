@@ -13,7 +13,7 @@ streamlit run test_app.py
 
 ## Схема
 
-![Схема](images/schema.jpg)
+![Схема](images/shshema.jpg)
 
 ## Примеры работы 
 
